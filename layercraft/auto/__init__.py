@@ -1,0 +1,1 @@
+"""Auto-extension sub-package."""
