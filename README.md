@@ -13,6 +13,7 @@ It provides a skill-based execution engine, a natural-language task parser, and 
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
+- [Raw Data End-to-End Case](#raw-data-end-to-end-case)
 - [Core Concepts](#core-concepts)
   - [Hierarchical JSON Data Format](#hierarchical-json-data-format)
   - [Entity Metadata](#entity-metadata)
@@ -63,6 +64,8 @@ LayerCraft/
 │       └── skill_generator.py  # Template & LLM-based skill synthesis
 ├── tests/
 │   └── test_core_engine.py     # Full test suite
+├── examples/
+│   └── run_raw_pipeline.py     # End-to-end pipeline on test_data/raw.json
 ├── analyze_structure.py        # CLI tool for JSON structure analysis
 ├── pyproject.toml
 └── README.md
@@ -167,6 +170,33 @@ for id_chain, attrs in navigator.iter_entity_instances("samples > bacteria"):
 # A1_1 OTU_2 0.6
 # A1_2 OTU_1 0.3
 # A1_2 OTU_2 0.7
+```
+
+## Raw Data End-to-End Case
+
+Use the provided script to run a full pipeline directly on `test_data/raw.json`.
+
+```bash
+python examples/run_raw_pipeline.py
+```
+
+What this case demonstrates in one run:
+
+- Structure analysis (`analyze_structure`) and metadata export.
+- `DataNavigator` + `TaskExecutor` pipeline execution.
+- Natural-language task parsing (`IntentParser`) for normalize/aggregate/correlate tasks.
+- Auto skill extension via alias operation (`norm` -> `normalize`).
+- Result export to compact summary JSON.
+
+Generated files:
+
+- `outputs/entities_from_raw.json` - generated entity metadata.
+- `outputs/pipeline_summary.json` - compact report with key outputs and previews.
+
+Optional: save fully enriched data (large file):
+
+```bash
+python examples/run_raw_pipeline.py --enriched-out outputs/raw_enriched.json
 ```
 
 ---

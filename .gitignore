@@ -18,6 +18,8 @@ env/
 .pytest_cache/
 .coverage
 htmlcov/
+outputs/
+test_data/
 
 # Editor
 .idea/
