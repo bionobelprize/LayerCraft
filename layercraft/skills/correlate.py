@@ -18,8 +18,8 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 from layercraft.core.navigator import DataNavigator
 
 
-class _EntityGroup(NamedTuple):
-    """Accumulated data for one group when running per-entity-ID correlation."""
+class _CorrelationGroup(NamedTuple):
+    """Accumulated paired values and targets for one correlation group."""
 
     x_values: List[float]
     y_values: List[float]
@@ -40,15 +40,18 @@ def correlate_skill(navigator: DataNavigator, task_spec: Dict[str, Any]) -> None
           are iterated.
         - ``operation_params.method`` – ``"pearson"``, ``"spearman"``, or
           ``"kendall"`` (default: ``"spearman"``).
-        - ``operation_params.group_by`` – (optional) when set to
-          ``"entity_id"``, the correlation is computed *per entity ID*
-          (the last element of each ``id_chain``) by aggregating all
-          instances that share that ID across different parent groups
-          (e.g. the same OTU across all samples).  The resulting
-          coefficient is written back to **every** occurrence of that
-          entity ID via :meth:`DataNavigator.set_property`.  When absent
-          or ``None`` the default global behaviour is used (single
-          coefficient stored as a root-level attribute).
+                - ``scope`` – controls correlation range:
+                    - ``"global"`` (default): compute one coefficient across all
+                        instances and store it at ``navigator.data[output_property]``.
+                    - ``"per_group"``: group by direct parent ID and compute one
+                        coefficient per group, written to each entity instance in the
+                        corresponding group.
+                    - ``"per_entity"`` (or ``"per_entity_id"``): group by leaf
+                        entity ID across parents (e.g. OTU across samples), then write
+                        each group's coefficient to all matching instances.
+                - ``operation_params.group_by`` – backward-compatibility alias.
+                    ``group_by="entity_id"`` maps to ``scope="per_entity"`` when
+                    ``scope`` is not provided.
         - ``data_sources`` – list of two source dicts, each with:
           - ``"property"`` – property name.
           - ``"inherited"`` – (optional bool) search ancestor nodes.
@@ -60,6 +63,7 @@ def correlate_skill(navigator: DataNavigator, task_spec: Dict[str, Any]) -> None
     params: Dict[str, Any] = task_spec.get("operation_params") or {}
     method: str = params.get("method", "spearman")
     group_by: Optional[str] = params.get("group_by")
+    scope: Optional[str] = task_spec.get("scope")
     sources: List[Dict[str, Any]] = task_spec.get("data_sources", [])
     output_property: str = task_spec.get(
         "output_property", f"correlation_{method}"
@@ -77,15 +81,31 @@ def correlate_skill(navigator: DataNavigator, task_spec: Dict[str, Any]) -> None
     prop_b = sources[1]["property"]
     inherited_b = sources[1].get("inherited", False)
 
-    if group_by == "entity_id":
-        _correlate_per_entity_id(
+    # Backward compatibility: old correlate specs used group_by only.
+    if scope is None and group_by == "entity_id":
+        scope = "per_entity"
+    if scope is None:
+        scope = "global"
+
+    if scope == "global":
+        _correlate_global(
+            navigator, entity_path, prop_a, inherited_a,
+            prop_b, inherited_b, method, output_property,
+        )
+    elif scope == "per_group":
+        _correlate_per_group(
+            navigator, entity_path, prop_a, inherited_a,
+            prop_b, inherited_b, method, output_property,
+        )
+    elif scope in ("per_entity", "per_entity_id"):
+        _correlate_per_entity(
             navigator, entity_path, prop_a, inherited_a,
             prop_b, inherited_b, method, output_property,
         )
     else:
-        _correlate_global(
-            navigator, entity_path, prop_a, inherited_a,
-            prop_b, inherited_b, method, output_property,
+        raise ValueError(
+            "Unsupported scope for correlate: "
+            f"'{scope}'. Expected one of: global, per_group, per_entity."
         )
 
 
@@ -179,7 +199,52 @@ def _correlate_global(
     navigator.data[output_property] = coeff
 
 
-def _correlate_per_entity_id(
+def _correlate_per_group(
+    navigator: DataNavigator,
+    entity_path: Tuple[str, ...],
+    prop_a: str,
+    inherited_a: bool,
+    prop_b: str,
+    inherited_b: bool,
+    method: str,
+    output_property: str,
+) -> None:
+    """Compute one coefficient per direct parent group.
+
+    Example for ``samples > bacteria``: one coefficient per sample, then
+    write that coefficient to all bacteria instances in that sample.
+    """
+    groups: Dict[str, _CorrelationGroup] = {}
+
+    for id_chain, attr_dict in navigator.iter_entity_instances(entity_path):
+        if len(id_chain) >= 2:
+            group_key = id_chain[-2]
+        elif id_chain:
+            group_key = id_chain[0]
+        else:
+            group_key = "__all__"
+
+        pair = _collect_pair(
+            navigator, entity_path, id_chain, attr_dict,
+            prop_a, inherited_a, prop_b, inherited_b,
+        )
+        if pair is None:
+            continue
+        if group_key not in groups:
+            groups[group_key] = _CorrelationGroup([], [], [])
+        groups[group_key].x_values.append(pair[0])
+        groups[group_key].y_values.append(pair[1])
+        groups[group_key].id_chains.append(list(id_chain))
+
+    for group in groups.values():
+        if len(group.x_values) < 2:
+            continue
+        coeff = _compute_correlation(group.x_values, group.y_values, method)
+        for chain in group.id_chains:
+            navigator.set_property(entity_path, chain, output_property, coeff)
+
+
+def _correlate_per_entity(
     navigator: DataNavigator,
     entity_path: Tuple[str, ...],
     prop_a: str,
@@ -198,7 +263,7 @@ def _correlate_per_entity_id(
     of the OTU node carries the same per-OTU correlation value.
     """
     # First pass: collect paired values and id_chains grouped by entity ID
-    groups: Dict[str, _EntityGroup] = {}
+    groups: Dict[str, _CorrelationGroup] = {}
 
     for id_chain, attr_dict in navigator.iter_entity_instances(entity_path):
         entity_id = id_chain[-1]
@@ -209,7 +274,7 @@ def _correlate_per_entity_id(
         if pair is None:
             continue
         if entity_id not in groups:
-            groups[entity_id] = _EntityGroup([], [], [])
+            groups[entity_id] = _CorrelationGroup([], [], [])
         groups[entity_id].x_values.append(pair[0])
         groups[entity_id].y_values.append(pair[1])
         groups[entity_id].id_chains.append(list(id_chain))

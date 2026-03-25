@@ -110,6 +110,7 @@ class IntentParser:
         target_entity = self._detect_entity(text_lower)
         target_property = self._detect_property(text_lower)
         method = self._detect_method(text_lower, operation)
+        scope = self._detect_scope(text_lower, operation)
 
         task_id = f"{operation}_{uuid.uuid4().hex[:6]}"
         output_property = self._infer_output_property(
@@ -121,12 +122,12 @@ class IntentParser:
             "target_entity": target_entity,
             "operation": operation,
             "operation_params": {"method": method} if method else {},
+            "scope": scope,
             "output_property": output_property,
         }
 
         if operation == "normalize":
             spec["target_property"] = target_property
-            spec["scope"] = "per_group"
 
         if operation == "correlate":
             props = self._detect_two_properties(text_lower)
@@ -137,7 +138,6 @@ class IntentParser:
 
         if operation == "aggregate":
             spec["target_property"] = target_property
-            spec["scope"] = "per_group"
             func = self._detect_agg_func(text_lower)
             spec["operation_params"] = {"func": func}
 
@@ -213,6 +213,25 @@ class IntentParser:
                 return "kendall"
             return "spearman"
         return ""
+
+    def _detect_scope(self, text: str, operation: str) -> str:
+        per_entity_kw = [
+            "per entity", "by entity", "entity id", "per otu", "by otu",
+            "按个体", "按实体", "按otu", "每个otu",
+        ]
+        per_group_kw = [
+            "per group", "by group", "per sample", "each sample",
+            "按组", "每组", "每个样本", "按样本",
+        ]
+        for kw in per_entity_kw:
+            if kw in text:
+                return "per_entity"
+        for kw in per_group_kw:
+            if kw in text:
+                return "per_group"
+        if operation == "correlate":
+            return "global"
+        return "per_group"
 
     def _detect_agg_func(self, text: str) -> str:
         if "mean" in text or "average" in text or "平均" in text:

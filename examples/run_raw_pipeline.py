@@ -90,6 +90,7 @@ def _build_tasks(parser: IntentParser) -> List[Dict[str, Any]]:
             "task_id": "nl_corr_bacteria_day",
             "target_entity": "samples > bacteria",
             "operation": "correlate",
+            "scope": "global",
             "operation_params": {"method": "spearman"},
             "data_sources": [
                 {"property": "abundance", "inherited": False},

@@ -35,8 +35,13 @@ def normalize_skill(navigator: DataNavigator, task_spec: Dict[str, Any]) -> None
           ``"normalized_abundance"``.
         - ``operation_params.method`` – one of ``"sum_to_one"``,
           ``"min_max"``, ``"z_score"`` (default: ``"sum_to_one"``).
-        - ``scope`` – ``"per_group"`` (normalize within each parent group,
-          e.g. per sample) or ``"global"`` (normalize across all instances).
+                - ``scope`` – controls normalization range:
+                    - ``"global"``: normalize across all instances.
+                    - ``"per_group"``: normalize within each direct parent group
+                        (e.g. per sample).
+                    - ``"per_entity"`` (or ``"per_entity_id"``): normalize across
+                        all occurrences of the same entity ID (last element of
+                        ``id_chain``).
         - ``scope_key`` – (for ``per_group``) the level of the parent ID to
           group by (currently uses the first element of the id_chain as the
           group key when scope is ``"per_group"``).
@@ -70,14 +75,28 @@ def normalize_skill(navigator: DataNavigator, task_spec: Dict[str, Any]) -> None
 
     if scope == "global":
         groups: Dict[str, List[int]] = {"__all__": list(range(len(id_chains)))}
-    else:
-        # Group by the parent instance ID (first element of the id_chain relative
-        # to the parent entity depth).  For a two-level entity like
-        # ("samples", "bacteria") the first id in the chain is the sample ID.
+    elif scope == "per_group":
+        # Group by direct parent ID (penultimate element in id_chain).
         groups = {}
         for idx, id_chain in enumerate(id_chains):
-            group_key = id_chain[0] if id_chain else "__all__"
+            if len(id_chain) >= 2:
+                group_key = id_chain[-2]
+            elif id_chain:
+                group_key = id_chain[0]
+            else:
+                group_key = "__all__"
             groups.setdefault(group_key, []).append(idx)
+    elif scope in ("per_entity", "per_entity_id"):
+        # Group by leaf entity ID (last element in id_chain) across parents.
+        groups = {}
+        for idx, id_chain in enumerate(id_chains):
+            group_key = id_chain[-1] if id_chain else "__all__"
+            groups.setdefault(group_key, []).append(idx)
+    else:
+        raise ValueError(
+            "Unsupported scope for normalize: "
+            f"'{scope}'. Expected one of: global, per_group, per_entity."
+        )
 
     normalized: List[float] = [0.0] * len(raw_values)
 

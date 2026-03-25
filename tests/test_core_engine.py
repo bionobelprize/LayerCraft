@@ -288,6 +288,27 @@ class TestNormalizeSkill:
         # OTU2 in A1_1 (abundance=300) should get normalized_abundance=1.0
         assert nav.data["samples"]["A1_1"]["bacteria"]["OTU2"]["normalized_abundance"] == 1.0
 
+    def test_per_entity_scope(self, navigator: DataNavigator) -> None:
+        executor = TaskExecutor()
+        task_spec = {
+            "task_id": "norm_per_entity",
+            "target_entity": "samples > bacteria",
+            "target_property": "abundance",
+            "scope": "per_entity",
+            "operation": "normalize",
+            "operation_params": {"method": "sum_to_one"},
+            "output_property": "entity_norm",
+        }
+        executor.execute(navigator, task_spec)
+
+        # OTU1 totals: 100 + 50 = 150 -> [2/3, 1/3]
+        assert abs(navigator.data["samples"]["A1_1"]["bacteria"]["OTU1"]["entity_norm"] - (2.0 / 3.0)) < 1e-9
+        assert abs(navigator.data["samples"]["A1_2"]["bacteria"]["OTU1"]["entity_norm"] - (1.0 / 3.0)) < 1e-9
+
+        # OTU2 totals: 300 + 150 = 450 -> [2/3, 1/3]
+        assert abs(navigator.data["samples"]["A1_1"]["bacteria"]["OTU2"]["entity_norm"] - (2.0 / 3.0)) < 1e-9
+        assert abs(navigator.data["samples"]["A1_2"]["bacteria"]["OTU2"]["entity_norm"] - (1.0 / 3.0)) < 1e-9
+
 
 # ---------------------------------------------------------------------------
 # Correlate skill tests
@@ -522,6 +543,30 @@ class TestCorrelateSkillGroupByEntityId:
             coeff = nav.data["samples"][f"S{i}"]["bacteria"]["OTU2"]["day_correlation"]
             assert abs(coeff + 1.0) < 1e-9, f"OTU2 S{i}: expected -1.0, got {coeff}"
 
+    def test_per_otu_spearman_via_scope_per_entity(self) -> None:
+        """New syntax: scope='per_entity' should match old group_by='entity_id'."""
+        nav = self._make_multi_otu_data()
+        executor = TaskExecutor()
+        task_spec = {
+            "task_id": "corr_per_otu_scope",
+            "target_entity": "samples > bacteria",
+            "scope": "per_entity",
+            "operation": "correlate",
+            "operation_params": {"method": "spearman"},
+            "data_sources": [
+                {"property": "normalized_abundance", "inherited": False},
+                {"property": "day", "inherited": True},
+            ],
+            "output_property": "scope_day_correlation",
+        }
+        executor.execute(nav, task_spec)
+
+        for i in range(1, 6):
+            coeff_otu1 = nav.data["samples"][f"S{i}"]["bacteria"]["OTU1"]["scope_day_correlation"]
+            coeff_otu2 = nav.data["samples"][f"S{i}"]["bacteria"]["OTU2"]["scope_day_correlation"]
+            assert abs(coeff_otu1 - 1.0) < 1e-9
+            assert abs(coeff_otu2 + 1.0) < 1e-9
+
     def test_per_otu_result_not_stored_at_root(self) -> None:
         """With group_by='entity_id' the root-level key must NOT be set."""
         nav = self._make_multi_otu_data()
@@ -539,6 +584,29 @@ class TestCorrelateSkillGroupByEntityId:
         }
         executor.execute(nav, task_spec)
         assert "day_correlation" not in nav.data
+
+    def test_per_group_scope_writes_per_parent_group(self) -> None:
+        nav = DataNavigator(copy.deepcopy(SAMPLE_DATA), ENTITIES_META)
+        executor = TaskExecutor()
+        task_spec = {
+            "task_id": "corr_per_group",
+            "target_entity": "samples > bacteria",
+            "scope": "per_group",
+            "operation": "correlate",
+            "operation_params": {"method": "pearson"},
+            "data_sources": [
+                {"property": "abundance", "inherited": False},
+                {"property": "abundance", "inherited": False},
+            ],
+            "output_property": "within_sample_corr",
+        }
+        executor.execute(nav, task_spec)
+
+        # Both samples have perfect self-correlation within their own OTU sets.
+        for sample_id in ("A1_1", "A1_2"):
+            for otu in ("OTU1", "OTU2"):
+                coeff = nav.data["samples"][sample_id]["bacteria"][otu]["within_sample_corr"]
+                assert abs(coeff - 1.0) < 1e-9
 
     def test_per_otu_pearson(self) -> None:
         """Same data should yield the same coefficients with Pearson."""
@@ -688,6 +756,24 @@ class TestAggregateSkill:
         # (100 + 300 + 50 + 150) / 4 = 150
         assert navigator.data["mean_abundance"] == 150.0
 
+    def test_sum_per_entity_scope(self, navigator: DataNavigator) -> None:
+        executor = TaskExecutor()
+        task_spec = {
+            "task_id": "agg_per_entity",
+            "target_entity": "samples > bacteria",
+            "target_property": "abundance",
+            "scope": "per_entity",
+            "operation": "aggregate",
+            "operation_params": {"func": "sum"},
+            "output_property": "entity_total_abundance",
+        }
+        executor.execute(navigator, task_spec)
+
+        assert navigator.data["samples"]["A1_1"]["bacteria"]["OTU1"]["entity_total_abundance"] == 150.0
+        assert navigator.data["samples"]["A1_2"]["bacteria"]["OTU1"]["entity_total_abundance"] == 150.0
+        assert navigator.data["samples"]["A1_1"]["bacteria"]["OTU2"]["entity_total_abundance"] == 450.0
+        assert navigator.data["samples"]["A1_2"]["bacteria"]["OTU2"]["entity_total_abundance"] == 450.0
+
 
 # ---------------------------------------------------------------------------
 # TaskExecutor tests
@@ -755,6 +841,13 @@ class TestIntentParser:
         spec = parser.parse("计算bacteria的abundance和day的spearman相关性系数")
         assert spec["operation"] == "correlate"
         assert spec["operation_params"]["method"] == "spearman"
+        assert spec["scope"] == "global"
+
+    def test_parse_correlate_per_entity_scope(self) -> None:
+        parser = self._parser()
+        spec = parser.parse("按OTU计算abundance和day的spearman相关性")
+        assert spec["operation"] == "correlate"
+        assert spec["scope"] == "per_entity"
 
     def test_parse_aggregate(self) -> None:
         parser = self._parser()
