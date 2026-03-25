@@ -13,9 +13,17 @@ Supported methods
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 from layercraft.core.navigator import DataNavigator
+
+
+class _EntityGroup(NamedTuple):
+    """Accumulated data for one group when running per-entity-ID correlation."""
+
+    x_values: List[float]
+    y_values: List[float]
+    id_chains: List[List[str]]
 
 
 def correlate_skill(navigator: DataNavigator, task_spec: Dict[str, Any]) -> None:
@@ -32,6 +40,15 @@ def correlate_skill(navigator: DataNavigator, task_spec: Dict[str, Any]) -> None
           are iterated.
         - ``operation_params.method`` – ``"pearson"``, ``"spearman"``, or
           ``"kendall"`` (default: ``"spearman"``).
+        - ``operation_params.group_by`` – (optional) when set to
+          ``"entity_id"``, the correlation is computed *per entity ID*
+          (the last element of each ``id_chain``) by aggregating all
+          instances that share that ID across different parent groups
+          (e.g. the same OTU across all samples).  The resulting
+          coefficient is written back to **every** occurrence of that
+          entity ID via :meth:`DataNavigator.set_property`.  When absent
+          or ``None`` the default global behaviour is used (single
+          coefficient stored as a root-level attribute).
         - ``data_sources`` – list of two source dicts, each with:
           - ``"property"`` – property name.
           - ``"inherited"`` – (optional bool) search ancestor nodes.
@@ -42,6 +59,7 @@ def correlate_skill(navigator: DataNavigator, task_spec: Dict[str, Any]) -> None
     target_entity_display: str = task_spec["target_entity"]
     params: Dict[str, Any] = task_spec.get("operation_params") or {}
     method: str = params.get("method", "spearman")
+    group_by: Optional[str] = params.get("group_by")
     sources: List[Dict[str, Any]] = task_spec.get("data_sources", [])
     output_property: str = task_spec.get(
         "output_property", f"correlation_{method}"
@@ -59,29 +77,95 @@ def correlate_skill(navigator: DataNavigator, task_spec: Dict[str, Any]) -> None
     prop_b = sources[1]["property"]
     inherited_b = sources[1].get("inherited", False)
 
-    # Gather paired values across all instances
+    if group_by == "entity_id":
+        _correlate_per_entity_id(
+            navigator, entity_path, prop_a, inherited_a,
+            prop_b, inherited_b, method, output_property,
+        )
+    else:
+        _correlate_global(
+            navigator, entity_path, prop_a, inherited_a,
+            prop_b, inherited_b, method, output_property,
+        )
+
+
+def _collect_pair(
+    navigator: DataNavigator,
+    entity_path: Tuple[str, ...],
+    id_chain: List[str],
+    attr_dict: Dict[str, Any],
+    prop_a: str,
+    inherited_a: bool,
+    prop_b: str,
+    inherited_b: bool,
+) -> Optional[Tuple[float, float]]:
+    """Return ``(float_a, float_b)`` for one instance, or ``None`` to skip.
+
+    Parameters
+    ----------
+    navigator:
+        The :class:`DataNavigator` used for inherited property look-ups.
+    entity_path:
+        Tuple identifying the entity collection (e.g. ``("samples",
+        "bacteria")``).
+    id_chain:
+        List of IDs locating this specific instance (e.g.
+        ``["S1", "OTU1"]``).
+    attr_dict:
+        The instance's own attribute dict as yielded by
+        :meth:`DataNavigator.iter_entity_instances`.
+    prop_a:
+        Name of the first property to retrieve.
+    inherited_a:
+        When *True*, search ancestor nodes for *prop_a* if it is not in
+        *attr_dict*.
+    prop_b:
+        Name of the second property to retrieve.
+    inherited_b:
+        When *True*, search ancestor nodes for *prop_b* if it is not in
+        *attr_dict*.
+    """
+    if prop_a in attr_dict and not inherited_a:
+        val_a = attr_dict[prop_a]
+    else:
+        val_a = navigator.get_property(entity_path, id_chain, prop_a)
+
+    if prop_b in attr_dict and not inherited_b:
+        val_b = attr_dict[prop_b]
+    else:
+        val_b = navigator.get_property(entity_path, id_chain, prop_b)
+
+    if val_a is None or val_b is None:
+        return None
+    try:
+        return float(val_a), float(val_b)
+    except (TypeError, ValueError):
+        return None
+
+
+def _correlate_global(
+    navigator: DataNavigator,
+    entity_path: Tuple[str, ...],
+    prop_a: str,
+    inherited_a: bool,
+    prop_b: str,
+    inherited_b: bool,
+    method: str,
+    output_property: str,
+) -> None:
+    """Compute a single correlation across all entity instances and store it
+    as a root-level attribute on the navigator data dict."""
     x_vals: List[float] = []
     y_vals: List[float] = []
 
     for id_chain, attr_dict in navigator.iter_entity_instances(entity_path):
-        # Resolve property A
-        if prop_a in attr_dict and not inherited_a:
-            val_a = attr_dict[prop_a]
-        else:
-            val_a = navigator.get_property(entity_path, id_chain, prop_a)
-        # Resolve property B
-        if prop_b in attr_dict and not inherited_b:
-            val_b = attr_dict[prop_b]
-        else:
-            val_b = navigator.get_property(entity_path, id_chain, prop_b)
-
-        if val_a is None or val_b is None:
-            continue
-        try:
-            x_vals.append(float(val_a))
-            y_vals.append(float(val_b))
-        except (TypeError, ValueError):
-            continue
+        pair = _collect_pair(
+            navigator, entity_path, id_chain, attr_dict,
+            prop_a, inherited_a, prop_b, inherited_b,
+        )
+        if pair is not None:
+            x_vals.append(pair[0])
+            y_vals.append(pair[1])
 
     if len(x_vals) < 2:
         return
@@ -93,6 +177,50 @@ def correlate_skill(navigator: DataNavigator, task_spec: Dict[str, Any]) -> None
     # Since this is a global stat we store it as a root-level attribute
     # keyed by output_property.
     navigator.data[output_property] = coeff
+
+
+def _correlate_per_entity_id(
+    navigator: DataNavigator,
+    entity_path: Tuple[str, ...],
+    prop_a: str,
+    inherited_a: bool,
+    prop_b: str,
+    inherited_b: bool,
+    method: str,
+    output_property: str,
+) -> None:
+    """Compute one correlation coefficient per unique entity ID (last element
+    of ``id_chain``) by aggregating all instances that share that ID across
+    different parent groups (e.g. the same OTU across all samples).
+
+    The resulting coefficient is written back to **every** occurrence of the
+    entity ID via :meth:`DataNavigator.set_property`, so each sample's copy
+    of the OTU node carries the same per-OTU correlation value.
+    """
+    # First pass: collect paired values and id_chains grouped by entity ID
+    groups: Dict[str, _EntityGroup] = {}
+
+    for id_chain, attr_dict in navigator.iter_entity_instances(entity_path):
+        entity_id = id_chain[-1]
+        pair = _collect_pair(
+            navigator, entity_path, id_chain, attr_dict,
+            prop_a, inherited_a, prop_b, inherited_b,
+        )
+        if pair is None:
+            continue
+        if entity_id not in groups:
+            groups[entity_id] = _EntityGroup([], [], [])
+        groups[entity_id].x_values.append(pair[0])
+        groups[entity_id].y_values.append(pair[1])
+        groups[entity_id].id_chains.append(list(id_chain))
+
+    # Second pass: compute correlation per group and write to every instance
+    for entity_id, group in groups.items():
+        if len(group.x_values) < 2:
+            continue
+        coeff = _compute_correlation(group.x_values, group.y_values, method)
+        for chain in group.id_chains:
+            navigator.set_property(entity_path, chain, output_property, coeff)
 
 
 def _compute_correlation(x: List[float], y: List[float], method: str) -> float:
