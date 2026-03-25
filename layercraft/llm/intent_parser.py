@@ -214,7 +214,13 @@ class IntentParser:
             return "spearman"
         return ""
 
-    def _detect_scope(self, text: str, operation: str) -> str:
+    def _detect_scope(self, text: str, operation: str) -> Dict[str, str]:
+        """Return a scope dict with a ``"target"`` key.
+
+        The dict format is the recommended scope representation.
+        ``{"target": "root"}`` means global; any other target is an entity
+        display path that defines the grouping level.
+        """
         per_entity_kw = [
             "per entity", "by entity", "entity id", "per otu", "by otu",
             "按个体", "按实体", "按otu", "每个otu",
@@ -225,13 +231,42 @@ class IntentParser:
         ]
         for kw in per_entity_kw:
             if kw in text:
-                return "per_entity"
+                # Group by leaf entity ID across parents.
+                target = self._entity_display_paths[-1] if self._entity_display_paths else "root"
+                return {"target": target}
         for kw in per_group_kw:
             if kw in text:
-                return "per_group"
+                # Group by the immediate parent entity.
+                target = self._detect_parent_entity(text)
+                return {"target": target}
         if operation == "correlate":
-            return "global"
-        return "per_group"
+            return {"target": "root"}
+        # Default: group by the immediate parent (equivalent to legacy per_group).
+        target = self._detect_parent_entity(text)
+        return {"target": target}
+
+    def _detect_parent_entity(self, text: str) -> str:
+        """Return the display path of the parent entity hinted by *text*, or
+        ``"root"`` when no parent can be determined."""
+        # Walk detected entity paths from longest (most specific) to shortest.
+        detected = self._detect_entity(text)
+        # Find an entity one level up from the detected entity.
+        for display in sorted(self._entity_display_paths, key=len, reverse=True):
+            lower = display.lower()
+            if lower in text or display.split(" > ")[-1].lower() in text:
+                # Check if there is a shorter entity that is a prefix of this one.
+                parts = display.split(" > ")
+                if len(parts) > 1:
+                    parent_display = " > ".join(parts[:-1])
+                    if parent_display in self._entity_display_paths:
+                        return parent_display
+        # Fall back: if the detected entity has a known parent, use it.
+        for entity in self._meta.get("entities", []):
+            if entity.get("entity_path_display") == detected:
+                parent = entity.get("parent_entity")
+                if parent:
+                    return parent
+        return "root"
 
     def _detect_agg_func(self, text: str) -> str:
         if "mean" in text or "average" in text or "平均" in text:

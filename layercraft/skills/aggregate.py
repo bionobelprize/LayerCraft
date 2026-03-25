@@ -12,16 +12,22 @@ Supported functions
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 from layercraft.core.navigator import DataNavigator
+from layercraft.skills._scope import resolve_scope, _GLOBAL, _PER_ENTITY
+
+
+PathKey = Tuple[str, ...]
 
 
 def aggregate_skill(navigator: DataNavigator, task_spec: Dict[str, Any]) -> None:
-    """Aggregate *target_property* for every parent group.
+    """Aggregate *target_property* values and write the result to each group.
 
-    The result is written onto each **parent** instance attribute dict
-    as *output_property*.
+    The result is written onto each **target-level** instance.  For
+    ``{"target": "samples"}`` the aggregated value is placed on each
+    sample dict; for ``{"target": "root"}`` a single global value is
+    stored at ``navigator.data[output_property]``.
 
     Parameters
     ----------
@@ -30,33 +36,44 @@ def aggregate_skill(navigator: DataNavigator, task_spec: Dict[str, Any]) -> None
     task_spec:
         Must contain:
 
-        - ``target_entity`` – display path of the leaf entity to aggregate,
-          e.g. ``"samples > bacteria"``.
+        - ``target_entity`` – display path of the leaf entity to
+          aggregate, e.g. ``"samples > bacteria"``.
         - ``target_property`` – numeric property to aggregate.
-        - ``output_property`` – where to write the result on the parent
-          instance (e.g. on each sample dict).
+        - ``output_property`` – where to write the result.
         - ``operation_params.func`` – one of ``"sum"``, ``"mean"``,
           ``"count"``, ``"min"``, ``"max"``, ``"median"``
           (default: ``"sum"``).
-                - ``scope`` – controls aggregation range:
-                    - ``"global"``: one value across all instances, stored at
-                        ``navigator.data[output_property]``.
-                    - ``"per_group"`` (default): group by direct parent ID; write
-                        one value to each parent instance.
-                    - ``"per_entity"`` (or ``"per_entity_id"``): group by leaf
-                        entity ID across parents; write one value to each matching
-                        entity instance.
+        - ``scope`` – **required**.  Controls aggregation range:
+
+          *New dict format*::
+
+              {"source": "<entity_path>", "target": "<entity_path>"}
+
+          ``target`` may be ``"root"`` (one global value) or any entity
+          display path (one value per instance at that level; instances
+          of the source entity are grouped by their ancestor at the
+          target level and the aggregated value is written to each
+          target-level instance).
+
+          *Legacy strings (still accepted)*:
+
+          - ``"global"``   – one value across all instances, at root.
+          - ``"per_group"`` – group by direct parent; write to parent.
+          - ``"per_entity"`` / ``"per_entity_id"`` – group by leaf
+            entity ID across parents; write to each matching instance.
     """
     target_entity_display: str = task_spec["target_entity"]
     target_property: str = task_spec["target_property"]
     output_property: str = task_spec.get("output_property", f"agg_{target_property}")
     params: Dict[str, Any] = task_spec.get("operation_params") or {}
     func_name: str = params.get("func", "sum")
-    scope: str = task_spec.get("scope", "per_group")
+    scope = task_spec.get("scope")
 
     entity_path = navigator.resolve_entity_path(target_entity_display)
     if entity_path is None:
         raise ValueError(f"Cannot resolve entity path: '{target_entity_display}'")
+
+    group_depth, target_path = resolve_scope(scope, entity_path, navigator)
 
     # Collect (id_chain, value) pairs
     id_chains: List[List[str]] = []
@@ -74,12 +91,18 @@ def aggregate_skill(navigator: DataNavigator, task_spec: Dict[str, Any]) -> None
     if not id_chains:
         return
 
-    if scope == "global":
+    # ------------------------------------------------------------------
+    # Global: one value for the entire dataset
+    # ------------------------------------------------------------------
+    if group_depth == _GLOBAL:
         agg_val = _apply_func(raw_values, func_name)
         navigator.data[output_property] = agg_val
         return
 
-    if scope in ("per_entity", "per_entity_id"):
+    # ------------------------------------------------------------------
+    # Legacy per_entity: group by leaf entity ID across all parents
+    # ------------------------------------------------------------------
+    if group_depth == _PER_ENTITY:
         entity_groups: Dict[str, List[float]] = {}
         entity_chains: Dict[str, List[List[str]]] = {}
         for id_chain, val in zip(id_chains, raw_values):
@@ -93,37 +116,31 @@ def aggregate_skill(navigator: DataNavigator, task_spec: Dict[str, Any]) -> None
                 navigator.set_property(entity_path, chain, output_property, agg_val)
         return
 
-    if scope != "per_group":
-        raise ValueError(
-            "Unsupported scope for aggregate: "
-            f"'{scope}'. Expected one of: global, per_group, per_entity."
-        )
-
-    # Group by parent (penultimate id chain element is the parent ID,
-    # and the parent entity path is entity_path[:-1]).
-    parent_entity_path = entity_path[:-1]
-
-    # Map parent_id → list of values
-    groups: Dict[str, List[float]] = {}
-    group_parent_chain: Dict[str, List[str]] = {}
+    # ------------------------------------------------------------------
+    # Depth-based: group by the first group_depth levels of the id_chain
+    # and write to each instance at that level.  This handles arbitrary
+    # ancestor depths in deep hierarchies.
+    # ------------------------------------------------------------------
+    groups: Dict[Any, List[float]] = {}
+    group_target_chains: Dict[Any, List[str]] = {}
 
     for id_chain, val in zip(id_chains, raw_values):
-        if len(id_chain) >= 2:
-            parent_id = id_chain[-2]
-            parent_chain = id_chain[:-1]
+        if group_depth <= len(id_chain):
+            group_key: Any = tuple(id_chain[:group_depth])
+            target_chain = list(id_chain[:group_depth])
         else:
-            parent_id = id_chain[0] if id_chain else "__root__"
-            parent_chain = []
-        groups.setdefault(parent_id, []).append(val)
-        group_parent_chain[parent_id] = parent_chain
+            group_key = tuple(id_chain)
+            target_chain = list(id_chain)
+        groups.setdefault(group_key, []).append(val)
+        group_target_chains[group_key] = target_chain
 
-    for parent_id, vals in groups.items():
+    for group_key, vals in groups.items():
         agg_val = _apply_func(vals, func_name)
-        parent_chain = group_parent_chain[parent_id]
-        if parent_chain and parent_entity_path:
+        target_chain = group_target_chains[group_key]
+        if target_path:
             try:
                 navigator.set_property(
-                    parent_entity_path, parent_chain, output_property, agg_val
+                    target_path, target_chain, output_property, agg_val
                 )
             except KeyError:
                 pass

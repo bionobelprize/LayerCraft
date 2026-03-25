@@ -154,7 +154,7 @@ task = {
     "task_id": "norm_001",
     "target_entity": "samples > bacteria",
     "target_property": "abundance",
-    "scope": "per_group",
+    "scope": {"target": "samples"},
     "operation": "normalize",
     "operation_params": {"method": "sum_to_one"},
     "output_property": "normalized_abundance",
@@ -242,9 +242,50 @@ A task spec is a plain Python `dict`:
 | `target_property` | Yes | Property name to operate on |
 | `operation` | Yes | Skill name, e.g. `"normalize"`, `"aggregate"`, `"correlate"` |
 | `operation_params` | No | Dict of keyword arguments forwarded to the skill |
-| `scope` | No | `"per_group"` (default) or `"global"` |
-| `output_property` | No | Where to write results (defaults to `target_property`) |
-| `source_property` | No | Second property for binary operations like `correlate` |
+| `scope` | **Yes** | See [Scope](#scope) below |
+| `output_property` | No | Where to write results (defaults to a skill-specific name) |
+
+### Scope
+
+`scope` is a **required** parameter that answers two questions:
+*where does the new attribute data come from*, and *where should the result be written*.
+
+#### New dict format (recommended)
+
+```python
+scope = {
+    "source": "<entity_display_path>",   # optional – entity to read from
+    "target": "<entity_display_path>",   # required – "root" or any entity path
+}
+```
+
+| `target` value | Effect |
+|----------------|--------|
+| `"root"` | One global result, written to `navigator.data[output_property]` |
+| Entity display path | One result per instance at that hierarchy level.  Source instances are grouped by their ancestor at the target level. |
+
+The `"target"` entity may be **any ancestor** in the hierarchy, regardless of depth.  This is what makes the new format powerful for deeply nested data structures:
+
+```python
+# Deeply nested: project > samples > bacteria > genes
+
+# Aggregate genes at the sample level
+scope = {"target": "project > samples"}
+
+# Aggregate genes at the project level (skip two levels)
+scope = {"target": "project"}
+
+# One global aggregate
+scope = {"target": "root"}
+```
+
+#### Legacy string format (backward-compatible)
+
+| String | Equivalent dict |
+|--------|----------------|
+| `"global"` | `{"target": "root"}` |
+| `"per_group"` | `{"target": "<direct parent entity>"}` |
+| `"per_entity"` / `"per_entity_id"` | group by leaf entity ID across all parent contexts |
 
 ---
 
@@ -320,7 +361,7 @@ task = {
     "target_property": "abundance",
     "operation": "normalize",
     "operation_params": {"method": "sum_to_one"},  # or "min_max" / "z_score"
-    "scope": "per_group",                           # or "global"
+    "scope": {"target": "samples"},                 # normalise within each sample
     "output_property": "norm_abundance",
 }
 ```
@@ -333,7 +374,7 @@ task = {
 
 #### aggregate
 
-Collapse child-entity properties up to parent instances.
+Collapse child-entity properties to any ancestor level.
 
 ```python
 task = {
@@ -341,12 +382,13 @@ task = {
     "target_entity": "samples > bacteria",
     "target_property": "abundance",
     "operation": "aggregate",
-    "operation_params": {"function": "sum"},  # sum | mean | count | min | max | median
+    "operation_params": {"func": "sum"},  # sum | mean | count | min | max | median
+    "scope": {"target": "samples"},       # write result to each sample instance
     "output_property": "total_abundance",
 }
 ```
 
-Results are written onto the **parent** entity (`samples` in this example).
+Results are written onto every instance at the `scope["target"]` level.
 
 #### correlate
 
@@ -356,10 +398,9 @@ Compute pairwise correlation between two properties across entity instances.
 task = {
     "task_id": "corr_001",
     "target_entity": "samples > bacteria",
-    "target_property": "abundance",
-    "source_property": "rel_abundance",
     "operation": "correlate",
     "operation_params": {"method": "pearson"},  # pearson | spearman | kendall
+    "scope": {"target": "samples"},             # one coefficient per sample
     "output_property": "abundance_correlation",
 }
 ```
