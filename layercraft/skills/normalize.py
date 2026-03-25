@@ -13,9 +13,10 @@ Supported methods
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from layercraft.core.navigator import DataNavigator
+from layercraft.skills._scope import resolve_scope, _GLOBAL, _PER_ENTITY
 
 
 def normalize_skill(navigator: DataNavigator, task_spec: Dict[str, Any]) -> None:
@@ -31,31 +32,41 @@ def normalize_skill(navigator: DataNavigator, task_spec: Dict[str, Any]) -> None
         - ``target_entity`` – display path, e.g. ``"samples > bacteria"``.
         - ``target_property`` – property name to normalize, e.g.
           ``"abundance"``.
-        - ``output_property`` – where to write the result, e.g.
-          ``"normalized_abundance"``.
+        - ``scope`` – **required**.  Controls the normalization range:
+
+          *New dict format*::
+
+              {"source": "<entity_path>", "target": "<entity_path>"}
+
+          ``target`` may be ``"root"`` (normalize globally across all
+          instances) or any entity display path (normalize within each
+          group at that hierarchy level).  ``source`` is optional and
+          defaults to ``target_entity``.
+
+          *Legacy strings (still accepted)*:
+
+          - ``"global"`` – normalize across all instances.
+          - ``"per_group"`` – normalize within each direct parent group.
+          - ``"per_entity"`` / ``"per_entity_id"`` – normalize across
+            all occurrences sharing the same leaf entity ID.
+
+        - ``output_property`` – where to write the result (default:
+          ``"normalized_<target_property>"``).
         - ``operation_params.method`` – one of ``"sum_to_one"``,
           ``"min_max"``, ``"z_score"`` (default: ``"sum_to_one"``).
-                - ``scope`` – controls normalization range:
-                    - ``"global"``: normalize across all instances.
-                    - ``"per_group"``: normalize within each direct parent group
-                        (e.g. per sample).
-                    - ``"per_entity"`` (or ``"per_entity_id"``): normalize across
-                        all occurrences of the same entity ID (last element of
-                        ``id_chain``).
-        - ``scope_key`` – (for ``per_group``) the level of the parent ID to
-          group by (currently uses the first element of the id_chain as the
-          group key when scope is ``"per_group"``).
     """
     target_entity_display: str = task_spec["target_entity"]
     target_property: str = task_spec["target_property"]
     output_property: str = task_spec.get("output_property", f"normalized_{target_property}")
     params: Dict[str, Any] = task_spec.get("operation_params") or {}
     method: str = params.get("method", "sum_to_one")
-    scope: str = task_spec.get("scope", "per_group")
+    scope = task_spec.get("scope")
 
     entity_path = navigator.resolve_entity_path(target_entity_display)
     if entity_path is None:
         raise ValueError(f"Cannot resolve entity path: '{target_entity_display}'")
+
+    group_depth, _target_path = resolve_scope(scope, entity_path, navigator)
 
     # Collect all (id_chain, value) pairs
     id_chains: List[List[str]] = []
@@ -73,30 +84,25 @@ def normalize_skill(navigator: DataNavigator, task_spec: Dict[str, Any]) -> None
     if not id_chains:
         return
 
-    if scope == "global":
-        groups: Dict[str, List[int]] = {"__all__": list(range(len(id_chains)))}
-    elif scope == "per_group":
-        # Group by direct parent ID (penultimate element in id_chain).
-        groups = {}
+    # Build groups mapping group_key → list of indices into id_chains/raw_values
+    groups: Dict[Any, List[int]] = {}
+
+    if group_depth == _GLOBAL:
+        groups["__all__"] = list(range(len(id_chains)))
+    elif group_depth == _PER_ENTITY:
+        # Legacy per_entity: group by leaf entity ID across all parent contexts.
         for idx, id_chain in enumerate(id_chains):
-            if len(id_chain) >= 2:
-                group_key = id_chain[-2]
-            elif id_chain:
-                group_key = id_chain[0]
-            else:
-                group_key = "__all__"
-            groups.setdefault(group_key, []).append(idx)
-    elif scope in ("per_entity", "per_entity_id"):
-        # Group by leaf entity ID (last element in id_chain) across parents.
-        groups = {}
-        for idx, id_chain in enumerate(id_chains):
-            group_key = id_chain[-1] if id_chain else "__all__"
+            group_key: Any = id_chain[-1] if id_chain else "__all__"
             groups.setdefault(group_key, []).append(idx)
     else:
-        raise ValueError(
-            "Unsupported scope for normalize: "
-            f"'{scope}'. Expected one of: global, per_group, per_entity."
-        )
+        # Depth-based grouping: group by the first group_depth elements of
+        # id_chain.  This supports arbitrary ancestor levels in deep hierarchies.
+        for idx, id_chain in enumerate(id_chains):
+            if group_depth <= len(id_chain):
+                group_key = tuple(id_chain[:group_depth])
+            else:
+                group_key = tuple(id_chain)
+            groups.setdefault(group_key, []).append(idx)
 
     normalized: List[float] = [0.0] * len(raw_values)
 

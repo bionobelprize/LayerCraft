@@ -16,6 +16,7 @@ import math
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 from layercraft.core.navigator import DataNavigator
+from layercraft.skills._scope import resolve_scope, _GLOBAL, _PER_ENTITY
 
 
 class _CorrelationGroup(NamedTuple):
@@ -40,22 +41,32 @@ def correlate_skill(navigator: DataNavigator, task_spec: Dict[str, Any]) -> None
           are iterated.
         - ``operation_params.method`` – ``"pearson"``, ``"spearman"``, or
           ``"kendall"`` (default: ``"spearman"``).
-                - ``scope`` – controls correlation range:
-                    - ``"global"`` (default): compute one coefficient across all
-                        instances and store it at ``navigator.data[output_property]``.
-                    - ``"per_group"``: group by direct parent ID and compute one
-                        coefficient per group, written to each entity instance in the
-                        corresponding group.
-                    - ``"per_entity"`` (or ``"per_entity_id"``): group by leaf
-                        entity ID across parents (e.g. OTU across samples), then write
-                        each group's coefficient to all matching instances.
-                - ``operation_params.group_by`` – backward-compatibility alias.
-                    ``group_by="entity_id"`` maps to ``scope="per_entity"`` when
-                    ``scope`` is not provided.
+        - ``scope`` – **required**.  Controls correlation range:
+
+          *New dict format*::
+
+              {"source": "<entity_path>", "target": "<entity_path>"}
+
+          ``target`` may be ``"root"`` (one global coefficient stored at
+          ``navigator.data[output_property]``) or any entity display path
+          (one coefficient per group at that level, written back to every
+          source-entity instance in the group).
+
+          *Legacy strings (still accepted)*:
+
+          - ``"global"``   – one coefficient across all instances.
+          - ``"per_group"`` – one coefficient per direct parent group,
+            written to each entity instance in that group.
+          - ``"per_entity"`` / ``"per_entity_id"`` – one coefficient per
+            leaf entity ID across parents.
+          - Backward-compat: ``operation_params.group_by="entity_id"``
+            is treated as ``scope="per_entity"`` when ``scope`` is absent.
+
         - ``data_sources`` – list of two source dicts, each with:
+
           - ``"property"`` – property name.
           - ``"inherited"`` – (optional bool) search ancestor nodes.
-          - ``"across"`` – ignored (kept for spec compatibility).
+
         - ``output_property`` – property name to write the correlation
           coefficient into.  Defaults to ``"correlation_<method>"``.
     """
@@ -63,7 +74,7 @@ def correlate_skill(navigator: DataNavigator, task_spec: Dict[str, Any]) -> None
     params: Dict[str, Any] = task_spec.get("operation_params") or {}
     method: str = params.get("method", "spearman")
     group_by: Optional[str] = params.get("group_by")
-    scope: Optional[str] = task_spec.get("scope")
+    scope = task_spec.get("scope")
     sources: List[Dict[str, Any]] = task_spec.get("data_sources", [])
     output_property: str = task_spec.get(
         "output_property", f"correlation_{method}"
@@ -84,28 +95,27 @@ def correlate_skill(navigator: DataNavigator, task_spec: Dict[str, Any]) -> None
     # Backward compatibility: old correlate specs used group_by only.
     if scope is None and group_by == "entity_id":
         scope = "per_entity"
+    # Further backward compatibility: if scope is still None, default to global.
     if scope is None:
         scope = "global"
 
-    if scope == "global":
+    group_depth, target_path = resolve_scope(scope, entity_path, navigator)
+
+    if group_depth == _GLOBAL:
         _correlate_global(
             navigator, entity_path, prop_a, inherited_a,
             prop_b, inherited_b, method, output_property,
         )
-    elif scope == "per_group":
-        _correlate_per_group(
-            navigator, entity_path, prop_a, inherited_a,
-            prop_b, inherited_b, method, output_property,
-        )
-    elif scope in ("per_entity", "per_entity_id"):
+    elif group_depth == _PER_ENTITY:
         _correlate_per_entity(
             navigator, entity_path, prop_a, inherited_a,
             prop_b, inherited_b, method, output_property,
         )
     else:
-        raise ValueError(
-            "Unsupported scope for correlate: "
-            f"'{scope}'. Expected one of: global, per_group, per_entity."
+        _correlate_by_depth(
+            navigator, entity_path, group_depth,
+            prop_a, inherited_a, prop_b, inherited_b,
+            method, output_property,
         )
 
 
@@ -199,9 +209,10 @@ def _correlate_global(
     navigator.data[output_property] = coeff
 
 
-def _correlate_per_group(
+def _correlate_by_depth(
     navigator: DataNavigator,
     entity_path: Tuple[str, ...],
+    group_depth: int,
     prop_a: str,
     inherited_a: bool,
     prop_b: str,
@@ -209,20 +220,27 @@ def _correlate_per_group(
     method: str,
     output_property: str,
 ) -> None:
-    """Compute one coefficient per direct parent group.
+    """Compute one coefficient per group defined by the first *group_depth*
+    id-chain elements, then write that coefficient back to every source-entity
+    instance in the group.
 
-    Example for ``samples > bacteria``: one coefficient per sample, then
-    write that coefficient to all bacteria instances in that sample.
+    This generalises the old ``"per_group"`` (where *group_depth* equals the
+    number of levels in the parent entity path) and supports arbitrary
+    ancestor levels in deep hierarchies.
+
+    Example for ``entity_path = ("samples", "bacteria")`` and
+    ``group_depth = 1``: one coefficient per sample, written to every
+    bacteria instance in that sample.
     """
-    groups: Dict[str, _CorrelationGroup] = {}
+    groups: Dict[Any, _CorrelationGroup] = {}
 
     for id_chain, attr_dict in navigator.iter_entity_instances(entity_path):
-        if len(id_chain) >= 2:
-            group_key = id_chain[-2]
+        if group_depth <= len(id_chain):
+            group_key: Any = tuple(id_chain[:group_depth])
         elif id_chain:
-            group_key = id_chain[0]
+            group_key = tuple(id_chain)
         else:
-            group_key = "__all__"
+            group_key = ("__all__",)
 
         pair = _collect_pair(
             navigator, entity_path, id_chain, attr_dict,

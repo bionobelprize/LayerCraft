@@ -841,13 +841,17 @@ class TestIntentParser:
         spec = parser.parse("计算bacteria的abundance和day的spearman相关性系数")
         assert spec["operation"] == "correlate"
         assert spec["operation_params"]["method"] == "spearman"
-        assert spec["scope"] == "global"
+        # New dict format: global correlation has target="root"
+        assert isinstance(spec["scope"], dict)
+        assert spec["scope"]["target"] == "root"
 
     def test_parse_correlate_per_entity_scope(self) -> None:
         parser = self._parser()
         spec = parser.parse("按OTU计算abundance和day的spearman相关性")
         assert spec["operation"] == "correlate"
-        assert spec["scope"] == "per_entity"
+        # New dict format: per-entity scope targets a specific entity level
+        assert isinstance(spec["scope"], dict)
+        assert spec["scope"]["target"] != "root"
 
     def test_parse_aggregate(self) -> None:
         parser = self._parser()
@@ -936,3 +940,365 @@ class TestAnalyzeStructureCLI:
 
         inherited_prop_names = [p["name"] for p in bacteria_entity["inherited_properties"]]
         assert "day" in inherited_prop_names
+
+
+# ---------------------------------------------------------------------------
+# Scope parameter – new dict format and required-scope tests
+# ---------------------------------------------------------------------------
+
+# Three-level hierarchy fixture: project > samples > bacteria
+DEEP_DATA: Dict[str, Any] = {
+    "projects": {
+        "P1": {
+            "name": "project_one",
+            "samples": {
+                "S1": {
+                    "day": 1,
+                    "bacteria": {
+                        "OTU1": {"abundance": 10},
+                        "OTU2": {"abundance": 90},
+                    },
+                },
+                "S2": {
+                    "day": 2,
+                    "bacteria": {
+                        "OTU1": {"abundance": 30},
+                        "OTU2": {"abundance": 70},
+                    },
+                },
+            },
+        },
+        "P2": {
+            "name": "project_two",
+            "samples": {
+                "S3": {
+                    "day": 3,
+                    "bacteria": {
+                        "OTU1": {"abundance": 20},
+                        "OTU2": {"abundance": 80},
+                    },
+                },
+            },
+        },
+    }
+}
+
+DEEP_META: Dict[str, Any] = {
+    "entities": [
+        {
+            "entity_path": ["projects"],
+            "entity_name": "projects",
+            "entity_path_display": "projects",
+            "parent_entity": None,
+            "collection_key_level": 1,
+            "id_level": 2,
+            "attribute_level": 3,
+            "instance_count": 2,
+            "id_examples": ["P1", "P2"],
+            "own_properties": [{"name": "name", "observed_count": 2, "types": ["str"]}],
+            "inherited_properties": [],
+            "all_available_properties": ["name"],
+            "child_entities": ["samples"],
+        },
+        {
+            "entity_path": ["projects", "samples"],
+            "entity_name": "samples",
+            "entity_path_display": "projects > samples",
+            "parent_entity": "projects",
+            "collection_key_level": 3,
+            "id_level": 4,
+            "attribute_level": 5,
+            "instance_count": 3,
+            "id_examples": ["S1", "S2", "S3"],
+            "own_properties": [{"name": "day", "observed_count": 3, "types": ["int"]}],
+            "inherited_properties": [],
+            "all_available_properties": ["day", "name"],
+            "child_entities": ["bacteria"],
+        },
+        {
+            "entity_path": ["projects", "samples", "bacteria"],
+            "entity_name": "bacteria",
+            "entity_path_display": "projects > samples > bacteria",
+            "parent_entity": "projects > samples",
+            "collection_key_level": 5,
+            "id_level": 6,
+            "attribute_level": 7,
+            "instance_count": 6,
+            "id_examples": ["OTU1", "OTU2"],
+            "own_properties": [{"name": "abundance", "observed_count": 6, "types": ["int"]}],
+            "inherited_properties": [
+                {"name": "day", "types": ["int"]},
+                {"name": "name", "types": ["str"]},
+            ],
+            "all_available_properties": ["abundance", "day", "name"],
+            "child_entities": [],
+        },
+    ]
+}
+
+
+@pytest.fixture()
+def deep_navigator() -> DataNavigator:
+    return DataNavigator(copy.deepcopy(DEEP_DATA), DEEP_META)
+
+
+class TestScopeDictFormat:
+    """Tests for the new dict-based scope format and required-scope enforcement."""
+
+    # ------------------------------------------------------------------
+    # scope is required
+    # ------------------------------------------------------------------
+
+    def test_normalize_missing_scope_raises(self, deep_navigator: DataNavigator) -> None:
+        executor = TaskExecutor()
+        with pytest.raises(ValueError, match="required"):
+            executor.execute(deep_navigator, {
+                "task_id": "t",
+                "target_entity": "projects > samples > bacteria",
+                "target_property": "abundance",
+                "operation": "normalize",
+                "operation_params": {"method": "sum_to_one"},
+                "output_property": "norm_abund",
+                # no "scope" key
+            })
+
+    def test_aggregate_missing_scope_raises(self, deep_navigator: DataNavigator) -> None:
+        executor = TaskExecutor()
+        with pytest.raises(ValueError, match="required"):
+            executor.execute(deep_navigator, {
+                "task_id": "t",
+                "target_entity": "projects > samples > bacteria",
+                "target_property": "abundance",
+                "operation": "aggregate",
+                "operation_params": {"func": "sum"},
+                "output_property": "total",
+                # no "scope" key
+            })
+
+    # ------------------------------------------------------------------
+    # New dict format – normalize
+    # ------------------------------------------------------------------
+
+    def test_normalize_dict_scope_target_root_is_global(
+        self, deep_navigator: DataNavigator
+    ) -> None:
+        """scope={'target': 'root'} normalises globally across all instances."""
+        executor = TaskExecutor()
+        executor.execute(deep_navigator, {
+            "task_id": "t",
+            "target_entity": "projects > samples > bacteria",
+            "target_property": "abundance",
+            "scope": {"target": "root"},
+            "operation": "normalize",
+            "operation_params": {"method": "sum_to_one"},
+            "output_property": "global_norm",
+        })
+        # Sum of all normalized values across the whole dataset must be 1.
+        total = 0.0
+        for p_attrs in deep_navigator.data["projects"].values():
+            for s_attrs in p_attrs["samples"].values():
+                for b_attrs in s_attrs["bacteria"].values():
+                    total += b_attrs.get("global_norm", 0.0)
+        assert abs(total - 1.0) < 1e-9
+
+    def test_normalize_dict_scope_target_parent_sample(
+        self, deep_navigator: DataNavigator
+    ) -> None:
+        """scope={'target': 'projects > samples'} normalises within each sample."""
+        executor = TaskExecutor()
+        executor.execute(deep_navigator, {
+            "task_id": "t",
+            "target_entity": "projects > samples > bacteria",
+            "target_property": "abundance",
+            "scope": {"target": "projects > samples"},
+            "operation": "normalize",
+            "operation_params": {"method": "sum_to_one"},
+            "output_property": "per_sample_norm",
+        })
+        # Within each sample the normalized values must sum to 1.
+        for p_attrs in deep_navigator.data["projects"].values():
+            for s_id, s_attrs in p_attrs["samples"].items():
+                total = sum(
+                    b.get("per_sample_norm", 0.0)
+                    for b in s_attrs["bacteria"].values()
+                )
+                assert abs(total - 1.0) < 1e-9, f"Sample {s_id} sum ≠ 1: {total}"
+
+    def test_normalize_dict_scope_target_grandparent_project(
+        self, deep_navigator: DataNavigator
+    ) -> None:
+        """scope={'target': 'projects'} normalises within each project."""
+        executor = TaskExecutor()
+        executor.execute(deep_navigator, {
+            "task_id": "t",
+            "target_entity": "projects > samples > bacteria",
+            "target_property": "abundance",
+            "scope": {"target": "projects"},
+            "operation": "normalize",
+            "operation_params": {"method": "sum_to_one"},
+            "output_property": "per_project_norm",
+        })
+        # Within each project the normalized values must sum to 1.
+        for p_id, p_attrs in deep_navigator.data["projects"].items():
+            total = sum(
+                b.get("per_project_norm", 0.0)
+                for s in p_attrs["samples"].values()
+                for b in s["bacteria"].values()
+            )
+            assert abs(total - 1.0) < 1e-9, f"Project {p_id} sum ≠ 1: {total}"
+
+    # ------------------------------------------------------------------
+    # New dict format – aggregate
+    # ------------------------------------------------------------------
+
+    def test_aggregate_dict_scope_target_root(
+        self, deep_navigator: DataNavigator
+    ) -> None:
+        """scope={'target': 'root'} aggregates all bacteria globally."""
+        executor = TaskExecutor()
+        executor.execute(deep_navigator, {
+            "task_id": "t",
+            "target_entity": "projects > samples > bacteria",
+            "target_property": "abundance",
+            "scope": {"target": "root"},
+            "operation": "aggregate",
+            "operation_params": {"func": "sum"},
+            "output_property": "global_total",
+        })
+        # P1: S1(10+90) + S2(30+70) = 200; P2: S3(20+80) = 100 → total = 300
+        assert deep_navigator.data["global_total"] == 300.0
+
+    def test_aggregate_dict_scope_target_sample(
+        self, deep_navigator: DataNavigator
+    ) -> None:
+        """scope={'target': 'projects > samples'} writes sum to each sample."""
+        executor = TaskExecutor()
+        executor.execute(deep_navigator, {
+            "task_id": "t",
+            "target_entity": "projects > samples > bacteria",
+            "target_property": "abundance",
+            "scope": {"target": "projects > samples"},
+            "operation": "aggregate",
+            "operation_params": {"func": "sum"},
+            "output_property": "sample_total",
+        })
+        assert deep_navigator.data["projects"]["P1"]["samples"]["S1"]["sample_total"] == 100.0
+        assert deep_navigator.data["projects"]["P1"]["samples"]["S2"]["sample_total"] == 100.0
+        assert deep_navigator.data["projects"]["P2"]["samples"]["S3"]["sample_total"] == 100.0
+
+    def test_aggregate_dict_scope_target_project(
+        self, deep_navigator: DataNavigator
+    ) -> None:
+        """scope={'target': 'projects'} writes sum to each project (skipping
+        2 hierarchy levels, not just 1)."""
+        executor = TaskExecutor()
+        executor.execute(deep_navigator, {
+            "task_id": "t",
+            "target_entity": "projects > samples > bacteria",
+            "target_property": "abundance",
+            "scope": {"target": "projects"},
+            "operation": "aggregate",
+            "operation_params": {"func": "sum"},
+            "output_property": "project_total",
+        })
+        # P1: S1(10+90) + S2(30+70) = 200
+        assert deep_navigator.data["projects"]["P1"]["project_total"] == 200.0
+        # P2: S3(20+80) = 100
+        assert deep_navigator.data["projects"]["P2"]["project_total"] == 100.0
+
+    # ------------------------------------------------------------------
+    # New dict format – correlate
+    # ------------------------------------------------------------------
+
+    def test_correlate_dict_scope_target_root_is_global(
+        self, deep_navigator: DataNavigator
+    ) -> None:
+        """scope={'target': 'root'} computes one global correlation."""
+        executor = TaskExecutor()
+        executor.execute(deep_navigator, {
+            "task_id": "t",
+            "target_entity": "projects > samples > bacteria",
+            "scope": {"target": "root"},
+            "operation": "correlate",
+            "operation_params": {"method": "pearson"},
+            "data_sources": [
+                {"property": "abundance", "inherited": False},
+                {"property": "abundance", "inherited": False},
+            ],
+            "output_property": "global_corr",
+        })
+        # self-correlation = 1.0
+        assert abs(deep_navigator.data["global_corr"] - 1.0) < 1e-9
+
+    def test_correlate_dict_scope_target_sample(
+        self, deep_navigator: DataNavigator
+    ) -> None:
+        """scope={'target': 'projects > samples'} computes one coefficient per
+        sample and writes it to each bacteria instance in that sample."""
+        executor = TaskExecutor()
+        executor.execute(deep_navigator, {
+            "task_id": "t",
+            "target_entity": "projects > samples > bacteria",
+            "scope": {"target": "projects > samples"},
+            "operation": "correlate",
+            "operation_params": {"method": "pearson"},
+            "data_sources": [
+                {"property": "abundance", "inherited": False},
+                {"property": "abundance", "inherited": False},
+            ],
+            "output_property": "sample_corr",
+        })
+        # Self-correlation within each sample must be 1.0.
+        for p_attrs in deep_navigator.data["projects"].values():
+            for s_attrs in p_attrs["samples"].values():
+                for b_attrs in s_attrs["bacteria"].values():
+                    assert abs(b_attrs["sample_corr"] - 1.0) < 1e-9
+
+    # ------------------------------------------------------------------
+    # scope=None raises ValueError
+    # ------------------------------------------------------------------
+
+    def test_resolve_scope_none_raises(self) -> None:
+        from layercraft.skills._scope import resolve_scope
+        nav = DataNavigator(copy.deepcopy(SAMPLE_DATA), ENTITIES_META)
+        with pytest.raises(ValueError, match="required"):
+            resolve_scope(None, ("samples", "bacteria"), nav)
+
+    def test_resolve_scope_unknown_string_raises(self) -> None:
+        from layercraft.skills._scope import resolve_scope
+        nav = DataNavigator(copy.deepcopy(SAMPLE_DATA), ENTITIES_META)
+        with pytest.raises(ValueError, match="Unrecognised"):
+            resolve_scope("bogus_scope", ("samples", "bacteria"), nav)
+
+    # ------------------------------------------------------------------
+    # Legacy string scopes still work
+    # ------------------------------------------------------------------
+
+    def test_legacy_global_still_works(self, navigator: DataNavigator) -> None:
+        executor = TaskExecutor()
+        executor.execute(navigator, {
+            "task_id": "t",
+            "target_entity": "samples > bacteria",
+            "target_property": "abundance",
+            "scope": "global",
+            "operation": "aggregate",
+            "operation_params": {"func": "sum"},
+            "output_property": "legacy_global_sum",
+        })
+        assert navigator.data["legacy_global_sum"] == 600.0
+
+    def test_legacy_per_group_still_works(self, navigator: DataNavigator) -> None:
+        executor = TaskExecutor()
+        executor.execute(navigator, {
+            "task_id": "t",
+            "target_entity": "samples > bacteria",
+            "target_property": "abundance",
+            "scope": "per_group",
+            "operation": "normalize",
+            "operation_params": {"method": "sum_to_one"},
+            "output_property": "legacy_norm",
+        })
+        for sample_id in ("A1_1", "A1_2"):
+            bacteria = navigator.data["samples"][sample_id]["bacteria"]
+            total = sum(b["legacy_norm"] for b in bacteria.values())
+            assert abs(total - 1.0) < 1e-9
