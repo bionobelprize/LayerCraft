@@ -427,6 +427,232 @@ class TestCorrelateSkill:
 
 
 # ---------------------------------------------------------------------------
+# Correlate skill – group_by="entity_id" tests
+# ---------------------------------------------------------------------------
+
+class TestCorrelateSkillGroupByEntityId:
+    """Tests for per-OTU (group_by='entity_id') correlation."""
+
+    def _make_multi_otu_data(self) -> DataNavigator:
+        """Create data with two OTUs across five samples.
+
+        OTU1: normalized_abundance == day  → perfect positive correlation
+        OTU2: normalized_abundance == -day → perfect negative correlation
+        """
+        data = {
+            "samples": {
+                f"S{i}": {
+                    "day": float(i),
+                    "bacteria": {
+                        "OTU1": {"normalized_abundance": float(i)},
+                        "OTU2": {"normalized_abundance": float(-i)},
+                    },
+                }
+                for i in range(1, 6)
+            }
+        }
+        meta = {
+            "entities": [
+                {
+                    "entity_path": ["samples"],
+                    "entity_name": "samples",
+                    "entity_path_display": "samples",
+                    "parent_entity": None,
+                    "collection_key_level": 1,
+                    "id_level": 2,
+                    "attribute_level": 3,
+                    "instance_count": 5,
+                    "id_examples": [f"S{i}" for i in range(1, 6)],
+                    "own_properties": [
+                        {"name": "day", "observed_count": 5, "types": ["float"]}
+                    ],
+                    "inherited_properties": [],
+                    "all_available_properties": ["day"],
+                    "child_entities": ["bacteria"],
+                },
+                {
+                    "entity_path": ["samples", "bacteria"],
+                    "entity_name": "bacteria",
+                    "entity_path_display": "samples > bacteria",
+                    "parent_entity": "samples",
+                    "collection_key_level": 3,
+                    "id_level": 4,
+                    "attribute_level": 5,
+                    "instance_count": 10,
+                    "id_examples": ["OTU1", "OTU2"],
+                    "own_properties": [
+                        {
+                            "name": "normalized_abundance",
+                            "observed_count": 10,
+                            "types": ["float"],
+                        }
+                    ],
+                    "inherited_properties": [{"name": "day", "types": ["float"]}],
+                    "all_available_properties": ["day", "normalized_abundance"],
+                    "child_entities": [],
+                },
+            ]
+        }
+        return DataNavigator(data, meta)
+
+    def test_per_otu_spearman_coefficient_values(self) -> None:
+        """OTU1 should have correlation +1, OTU2 should have correlation -1."""
+        nav = self._make_multi_otu_data()
+        executor = TaskExecutor()
+        task_spec = {
+            "task_id": "corr_per_otu",
+            "target_entity": "samples > bacteria",
+            "operation": "correlate",
+            "operation_params": {"method": "spearman", "group_by": "entity_id"},
+            "data_sources": [
+                {"property": "normalized_abundance", "inherited": False},
+                {"property": "day", "inherited": True},
+            ],
+            "output_property": "day_correlation",
+        }
+        executor.execute(nav, task_spec)
+
+        # All five sample nodes for OTU1 should carry coefficient ≈ +1.0
+        for i in range(1, 6):
+            coeff = nav.data["samples"][f"S{i}"]["bacteria"]["OTU1"]["day_correlation"]
+            assert abs(coeff - 1.0) < 1e-9, f"OTU1 S{i}: expected 1.0, got {coeff}"
+
+        # All five sample nodes for OTU2 should carry coefficient ≈ -1.0
+        for i in range(1, 6):
+            coeff = nav.data["samples"][f"S{i}"]["bacteria"]["OTU2"]["day_correlation"]
+            assert abs(coeff + 1.0) < 1e-9, f"OTU2 S{i}: expected -1.0, got {coeff}"
+
+    def test_per_otu_result_not_stored_at_root(self) -> None:
+        """With group_by='entity_id' the root-level key must NOT be set."""
+        nav = self._make_multi_otu_data()
+        executor = TaskExecutor()
+        task_spec = {
+            "task_id": "corr_per_otu_root_check",
+            "target_entity": "samples > bacteria",
+            "operation": "correlate",
+            "operation_params": {"method": "spearman", "group_by": "entity_id"},
+            "data_sources": [
+                {"property": "normalized_abundance", "inherited": False},
+                {"property": "day", "inherited": True},
+            ],
+            "output_property": "day_correlation",
+        }
+        executor.execute(nav, task_spec)
+        assert "day_correlation" not in nav.data
+
+    def test_per_otu_pearson(self) -> None:
+        """Same data should yield the same coefficients with Pearson."""
+        nav = self._make_multi_otu_data()
+        executor = TaskExecutor()
+        task_spec = {
+            "task_id": "corr_per_otu_pearson",
+            "target_entity": "samples > bacteria",
+            "operation": "correlate",
+            "operation_params": {"method": "pearson", "group_by": "entity_id"},
+            "data_sources": [
+                {"property": "normalized_abundance", "inherited": False},
+                {"property": "day", "inherited": True},
+            ],
+            "output_property": "pearson_day_corr",
+        }
+        executor.execute(nav, task_spec)
+        for i in range(1, 6):
+            assert (
+                abs(
+                    nav.data["samples"][f"S{i}"]["bacteria"]["OTU1"][
+                        "pearson_day_corr"
+                    ]
+                    - 1.0
+                )
+                < 1e-9
+            )
+
+    def test_per_otu_insufficient_data_skipped(self) -> None:
+        """An OTU that appears in fewer than 2 samples must not receive the
+        output property (not enough data for a correlation)."""
+        data = {
+            "samples": {
+                "S1": {
+                    "day": 1.0,
+                    "bacteria": {
+                        "OTU_SINGLE": {"normalized_abundance": 1.0},
+                        "OTU_MULTI": {"normalized_abundance": 1.0},
+                    },
+                },
+                "S2": {
+                    "day": 2.0,
+                    "bacteria": {
+                        "OTU_MULTI": {"normalized_abundance": 2.0},
+                    },
+                },
+            }
+        }
+        meta = {
+            "entities": [
+                {
+                    "entity_path": ["samples"],
+                    "entity_name": "samples",
+                    "entity_path_display": "samples",
+                    "parent_entity": None,
+                    "collection_key_level": 1,
+                    "id_level": 2,
+                    "attribute_level": 3,
+                    "instance_count": 2,
+                    "id_examples": ["S1", "S2"],
+                    "own_properties": [
+                        {"name": "day", "observed_count": 2, "types": ["float"]}
+                    ],
+                    "inherited_properties": [],
+                    "all_available_properties": ["day"],
+                    "child_entities": ["bacteria"],
+                },
+                {
+                    "entity_path": ["samples", "bacteria"],
+                    "entity_name": "bacteria",
+                    "entity_path_display": "samples > bacteria",
+                    "parent_entity": "samples",
+                    "collection_key_level": 3,
+                    "id_level": 4,
+                    "attribute_level": 5,
+                    "instance_count": 3,
+                    "id_examples": ["OTU_SINGLE", "OTU_MULTI"],
+                    "own_properties": [
+                        {
+                            "name": "normalized_abundance",
+                            "observed_count": 3,
+                            "types": ["float"],
+                        }
+                    ],
+                    "inherited_properties": [{"name": "day", "types": ["float"]}],
+                    "all_available_properties": ["day", "normalized_abundance"],
+                    "child_entities": [],
+                },
+            ]
+        }
+        nav = DataNavigator(data, meta)
+        executor = TaskExecutor()
+        task_spec = {
+            "task_id": "corr_insufficient",
+            "target_entity": "samples > bacteria",
+            "operation": "correlate",
+            "operation_params": {"method": "spearman", "group_by": "entity_id"},
+            "data_sources": [
+                {"property": "normalized_abundance", "inherited": False},
+                {"property": "day", "inherited": True},
+            ],
+            "output_property": "day_corr",
+        }
+        executor.execute(nav, task_spec)
+
+        # OTU_SINGLE only appears once → not enough data → no property written
+        assert "day_corr" not in nav.data["samples"]["S1"]["bacteria"]["OTU_SINGLE"]
+
+        # OTU_MULTI appears in both samples → coefficient written to both
+        assert "day_corr" in nav.data["samples"]["S1"]["bacteria"]["OTU_MULTI"]
+        assert "day_corr" in nav.data["samples"]["S2"]["bacteria"]["OTU_MULTI"]
+
+
+# ---------------------------------------------------------------------------
 # Aggregate skill tests
 # ---------------------------------------------------------------------------
 
