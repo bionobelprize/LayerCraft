@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""End-to-end LayerCraft pipeline on test_data/raw.json.
+"""End-to-end LayerCraft pipeline on raw hierarchical JSON.
 
-This script demonstrates the core LayerCraft workflow:
-1) Analyze hierarchical JSON structure and generate entities metadata.
-2) Build DataNavigator with data + metadata.
-3) Parse natural-language intents into task specs.
-4) Execute a multi-step task pipeline.
-5) Trigger auto skill generation via an alias operation.
-6) Export a compact analysis summary.
+This example mirrors the README "Raw Data End-to-End Case":
+1) Analyze the JSON structure and export entity metadata.
+2) Build DataNavigator + IntentParser.
+3) Build NL-driven task specs.
+4) Execute a multi-step pipeline with TaskExecutor.
+5) Demonstrate auto-extension via alias operation (norm -> normalize).
+6) Export a compact summary and optional enriched data.
 """
 
 from __future__ import annotations
@@ -55,17 +55,22 @@ def _analyze_structure(data: Dict[str, Any], max_id_examples: int = 5) -> Dict[s
 
 
 def _build_tasks(parser: IntentParser) -> List[Dict[str, Any]]:
-    # Natural-language driven specs
+    """Build a mixed pipeline of NL-parsed and hand-tuned task specs.
+
+    All tasks use README-aligned scope dicts: {"target": "..."}.
+    """
     normalize_task = parser.parse(
-        "Normalize bacteria abundance per sample using sum_to_one"
+        "Normalize bacteria abundance by sample using sum_to_one"
     )
     normalize_task.update(
         {
             "task_id": "nl_norm_bacteria",
-            "target_entity": "samples > bacteria",
+            "target_entity": "samples > metabolites",
             "target_property": "abundance",
-            "scope": "per_group",
-            "output_property": "norm_abundance_v2",
+            "operation": "normalize",
+            "operation_params": {"method": "sum_to_one"},
+            "scope": {"target": "samples"},
+            "output_property": "norm_abundance",
         }
     )
 
@@ -77,7 +82,9 @@ def _build_tasks(parser: IntentParser) -> List[Dict[str, Any]]:
             "task_id": "nl_agg_bacteria_sum",
             "target_entity": "samples > bacteria",
             "target_property": "abundance",
-            "scope": "per_group",
+            "operation": "aggregate",
+            "operation_params": {"func": "sum"},
+            "scope": {"target": "samples"},
             "output_property": "bacteria_total_abundance",
         }
     )
@@ -90,45 +97,37 @@ def _build_tasks(parser: IntentParser) -> List[Dict[str, Any]]:
             "task_id": "nl_corr_bacteria_day",
             "target_entity": "samples > bacteria",
             "operation": "correlate",
-            "scope": "global",
             "operation_params": {"method": "spearman"},
+            "scope": "per_entity",
             "data_sources": [
-                {"property": "abundance", "inherited": False},
-                {"property": "day", "inherited": True},
+                {"property": "normalized_abundance", "inherited": False},
+                {"property": "腐殖酸含量", "inherited": True},
             ],
-            "output_property": "bacteria_day_spearman",
+            "output_property": "bacteria_fzs_spearman",
         }
     )
 
-    # Auto-extension: use alias op "norm" (maps to built-in normalize skill)
     auto_extend_task = {
         "task_id": "auto_norm_fungi_alias",
         "target_entity": "samples > fungi",
         "target_property": "abundance",
-        "scope": "per_group",
         "operation": "norm",
         "operation_params": {"method": "min_max"},
+        "scope": {"target": "samples"},
         "output_property": "fungi_minmax_alias",
     }
 
-    # Global aggregation example
     global_agg_task = {
         "task_id": "global_metabolite_mean",
         "target_entity": "samples > metabolites",
         "target_property": "abundance",
-        "scope": "global",
         "operation": "aggregate",
         "operation_params": {"func": "mean"},
+        "scope": {"target": "root"},
         "output_property": "global_mean_metabolite_abundance",
     }
 
-    return [
-        normalize_task,
-        aggregate_task,
-        correlate_task,
-        auto_extend_task,
-        global_agg_task,
-    ]
+    return [normalize_task, aggregate_task, correlate_task, auto_extend_task, global_agg_task]
 
 
 def _collect_preview(navigator: DataNavigator, limit: int = 8) -> List[Dict[str, Any]]:
@@ -146,7 +145,7 @@ def _collect_preview(navigator: DataNavigator, limit: int = 8) -> List[Dict[str,
                 "sample_id": id_chain[0] if len(id_chain) >= 1 else None,
                 "otu_id": id_chain[1] if len(id_chain) >= 2 else None,
                 "abundance": attrs.get("abundance"),
-                "norm_abundance_v2": attrs.get("norm_abundance_v2"),
+                "norm_abundance": attrs.get("norm_abundance"),
                 "day": day_val,
             }
         )
@@ -180,6 +179,7 @@ def run_pipeline(
         "input": str(input_path),
         "entities_meta": str(entities_out),
         "task_count": len(tasks),
+        "task_ids": [t["task_id"] for t in tasks],
         "executed_operations": [t["operation"] for t in tasks],
         "registry_after_execution": executor.registry.list_operations(),
         "global_outputs": {
@@ -214,7 +214,7 @@ def run_pipeline(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run a full LayerCraft analysis pipeline on raw hierarchical JSON data."
+        description="Run the README end-to-end LayerCraft pipeline on raw hierarchical JSON data."
     )
     parser.add_argument(
         "--input",
